@@ -26,7 +26,7 @@ from typing import Dict, Optional
 
 from eth_account import Account
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, BUY, SELL
+from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.exceptions import PolyApiException
 
 from src.execution_engine.inventory_manager import InventoryManager

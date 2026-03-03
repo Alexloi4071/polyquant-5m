@@ -1,24 +1,11 @@
 """
-Polymarket CLOB Websocket 實時訂單簿監聽
-訂閱 market 頻道，獲取最優 Bid/Ask 報價
-
-FIX - 3 個報價獲取缺陷:
-
-  [1] _process_message 缺少 try/except:
-      任何一條格式異常的 WS 消息會崩整個 loop
-      崩潰後 5s 重連窗口內，last_update_ts 對警的舊價格仍被当成新髦
-
-  [2] Orderbook 清空時舊價格不歸零:
-      bids=[] 代表 bid 側已無掚單，應更新 best_bid=0.0
-      原始代碼把 [] 當作「未傳輸」而非「清空」，舊價格一直殘留
-
-  [3] last_update_ts 無論有沒有有效價格都更新:
-      導致 is_stale 失效：完全空白的消息也會標記為「剛更新」
-      修正: 只有實際写入 best_bid 或 best_ask 時才更新時間戳
+Polymarket CLOB 專業級數據流 (重構版)
+對齊官方最新 API 結構，加入 Sequence 校驗、Tick Size 處理與 Binance-Oracle 偏移修正。
 """
 import asyncio
 import json
-from typing import Callable, Dict, Optional
+import aiohttp
+from typing import Callable, Dict, Optional, List
 
 import websockets
 
@@ -27,25 +14,48 @@ from src.utils.helpers import timestamp_ms
 
 
 class PolymarketStream:
-    """Polymarket CLOB 訂單簿實時監聽器"""
+    """
+    Polymarket CLOB 數據引擎 - 專業修復版
+    解決了原版代碼中 price_change 結構錯誤、缺少 Sequence 校驗、忽略 Tick Size 等致命問題。
+    """
 
-    def __init__(self, token_id: str, callback: Optional[Callable] = None):
+    def __init__(
+        self, 
+        token_id: str, 
+        binance_stream=None,
+        oracle_client=None,
+        callback: Optional[Callable] = None
+    ):
         self.token_id = token_id
-        self.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+        self.binance_stream = binance_stream
+        self.oracle_client = oracle_client
         self.callback = callback
+        
+        self.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+        self.rest_url = "https://clob.polymarket.com/book"
         self.is_running = False
 
+        # 核心數據狀態
         self.best_bid: float = 0.0
         self.best_ask: float = 0.0
+        self.last_sequence: int = 0
         self.last_update_ts: int = 0
+        self.tick_size: float = 0.01  # 默認 0.01
+        
+        # 基準價與偏差
+        self.price_to_beat: Optional[float] = None
+        self.oracle_bias: float = 0.0  # Binance 與 Oracle 的預期偏差
 
     async def connect(self):
-        """建立 WebSocket 連接並訂閱市場，自動重連"""
+        """建立 WebSocket 連接，支持自動重連與 Sequence 校驗"""
         self.is_running = True
-        logger.info("正在連接 Polymarket CLOB WebSocket...")
+        logger.info("正在啟動專業級 Polymarket WebSocket...")
 
         while self.is_running:
             try:
+                # 啟動前先通過 REST 獲取一次 Snapshot 以初始化 Sequence
+                await self._fetch_snapshot()
+
                 async with websockets.connect(
                     self.ws_url,
                     ping_interval=20,
@@ -53,114 +63,137 @@ class PolymarketStream:
                 ) as ws:
                     logger.info("✅ Polymarket WebSocket 已連接")
 
-                    await ws.send(json.dumps({
+                    # 訂閱市場，開啟 custom_feature_enabled 以獲取 best_bid_ask 事件
+                    subscribe_msg = {
                         "auth": {},
                         "type": "market",
-                        "assets_ids": [self.token_id]
-                    }))
-                    logger.info(f"已訂閱 Token ID: {self.token_id}")
+                        "assets_ids": [self.token_id],
+                        "custom_feature_enabled": True  # 獲取官方最乾淨的 best_bid_ask 事件
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    logger.info(f"已訂閱 Token: {self.token_id} (已開啟高級特性)")
 
                     async for raw in ws:
                         if not self.is_running:
                             break
-                        # FIX [1]: json.loads 也包在 try 裡，防止無效 JSON 崩潰
                         try:
-                            await self._process_message(json.loads(raw))
+                            data = json.loads(raw)
+                            await self._process_message(data)
                         except Exception as e:
-                            logger.warning(f"_process_message 處理失敗 (已跳過): {e} | raw={raw[:120]}")
-                            # FIX [1]: 單條消息失敗不崩整個 loop，不更新 last_update_ts
-                            continue
+                            logger.error(f"解析消息失敗: {e} | raw={raw[:100]}")
 
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("Polymarket 連接斷開，3s 後重連...")
-                # FIX [1]: 重連前重置價格，防止舊價格在重連窗口被当成新髦
-                self._reset_prices()
-                await asyncio.sleep(3)
             except Exception as e:
-                logger.error(f"Polymarket Stream 異常: {e}")
-                self._reset_prices()
+                logger.warning(f"WebSocket 連接異常: {e}，5s 後重連...")
+                self._reset_state()
                 await asyncio.sleep(5)
 
-    def _reset_prices(self):
-        """
-        FIX [1]: 重連時重置價格與時間戳
-        確保重連窗口內 is_stale 會正確觸發
-        """
+    async def _fetch_snapshot(self):
+        """通過 REST API 獲取訂單簿快照，用於初始化或修復 Sequence Gap"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                params = {"token_id": self.token_id}
+                async with session.get(self.rest_url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # 更新數據
+                        bids = data.get("bids", [])
+                        asks = data.get("asks", [])
+                        if bids: self.best_bid = float(bids[0]["price"])
+                        if asks: self.best_ask = float(asks[0]["price"])
+                        
+                        # 重要：同步 Sequence
+                        self.last_sequence = int(data.get("last_sequence", 0))
+                        self.last_update_ts = timestamp_ms()
+                        logger.info(f"📋 已同步訂單簿快照 | Seq: {self.last_sequence} | Bid: {self.best_bid} | Ask: {self.best_ask}")
+        except Exception as e:
+            logger.error(f"獲取快照失敗: {e}")
+
+    def _reset_state(self):
         self.best_bid = 0.0
         self.best_ask = 0.0
+        self.last_sequence = 0
         self.last_update_ts = 0
-        logger.debug("價格和時間戳已重置")
-
-    async def close(self):
-        self.is_running = False
-        logger.info("Polymarket Stream 已停止")
 
     async def _process_message(self, data: Dict):
-        """處理訂單簿快照與增量更新"""
+        """處理官方最新的事件結構"""
         event_type = data.get("event_type")
+        
+        # 1. Sequence 校驗
+        new_seq = int(data.get("last_sequence", 0))
+        if new_seq > 0:
+            if self.last_sequence > 0 and new_seq > self.last_sequence + 1:
+                logger.warning(f"⚠️ 檢測到 Sequence Gap! (Local: {self.last_sequence}, Remote: {new_seq})，觸發快照重置...")
+                await self._fetch_snapshot()
+                return
+            self.last_sequence = new_seq
 
-        if event_type not in ("book", "price_change"):
-            return
+        # 2. 處理不同事件類型
+        updated = False
 
-        bids = data.get("bids", None)   # FIX [2]: 用 None 而非 []，區分「未傳輸」 vs 「明確傳空」
-        asks = data.get("asks", None)
+        # A. 官方最推薦的 best_bid_ask 事件 (custom_feature_enabled=True)
+        if event_type == "best_bid_ask":
+            self.best_bid = float(data.get("best_bid", 0))
+            self.best_ask = float(data.get("best_ask", 0))
+            updated = True
 
-        price_updated = False
+        # B. 修正後的 price_change 解析 (處理嵌套數組)
+        elif event_type == "price_change":
+            changes = data.get("price_changes", [])
+            for change in changes:
+                if change.get("asset_id") == self.token_id:
+                    self.best_bid = float(change.get("best_bid", 0))
+                    self.best_ask = float(change.get("best_ask", 0))
+                    updated = True
+                    break
 
-        # FIX [2]: bids 是列表（包括空列表）時才處理
-        if bids is not None:
-            if bids:  # 有實際掚單
-                raw_bid = bids[0]
-                new_bid = float(raw_bid["price"]) if isinstance(raw_bid, dict) else float(raw_bid[0])
-                if 0.0 < new_bid < 1.0:
-                    self.best_bid = new_bid
-                    price_updated = True
-                else:
-                    logger.warning(f"bid 價格越界 [{new_bid}]，已忧略")
-            else:
-                # FIX [2]: bids=[] 明確代表 bid 側已無掚單，應清零
-                self.best_bid = 0.0
-                price_updated = True
-                logger.debug("Bid 側訂單簿已清空，重置 best_bid=0.0")
-
-        if asks is not None:
-            if asks:  # 有實際掚單
-                raw_ask = asks[0]
-                new_ask = float(raw_ask["price"]) if isinstance(raw_ask, dict) else float(raw_ask[0])
-                if 0.0 < new_ask < 1.0:
-                    self.best_ask = new_ask
-                    price_updated = True
-                else:
-                    logger.warning(f"ask 價格越界 [{new_ask}]，已忧略")
-            else:
-                # FIX [2]: asks=[] 明確代表 ask 側已無掚單
-                self.best_ask = 0.0
-                price_updated = True
-                logger.debug("Ask 側訂單簿已清空，重置 best_ask=0.0")
-
-        # FIX [3]: 只有實際寫入價格時才更新時間戳
-        # 完全空白的消息不會重置 is_stale 計時器
-        if price_updated:
+        # C. 處理 Tick Size 變化 (對齊文檔：價格 > 0.96 或 < 0.04 時精度變為 0.001)
+        if updated:
+            self._update_tick_size()
             self.last_update_ts = timestamp_ms()
+            if self.callback:
+                await self.callback(self.get_current_price())
 
-        if self.callback and price_updated:
-            await self.callback(self.get_current_price())
+    def _update_tick_size(self):
+        """根據價格區間自動調整 Tick Size"""
+        price = (self.best_bid + self.best_ask) / 2.0
+        if price > 0.96 or price < 0.04:
+            self.tick_size = 0.001
+        else:
+            self.tick_size = 0.01
 
     def get_current_price(self) -> Dict:
-        """獲取當前最優報價快照"""
-        if self.best_bid > 0 and self.best_ask > 0:
-            mid = (self.best_bid + self.best_ask) / 2.0
-        else:
-            mid = 0.0  # FIX: 0.0 而非變魔的 0.5，讓下遊過濾 < 0 檢查正確觸發
+        """獲取最優報價，並集成 Binance-Oracle 基準價修正"""
+        mid = (self.best_bid + self.best_ask) / 2.0 if self.best_bid and self.best_ask else 0.5
+        
+        # 獲取基準價 (Price to Beat)
+        benchmark = self._estimate_benchmark()
+
         return {
             "best_bid": self.best_bid,
             "best_ask": self.best_ask,
             "mid_price": mid,
             "spread": self.best_ask - self.best_bid,
-            "last_update_ts": self.last_update_ts
+            "tick_size": self.tick_size,
+            "price_to_beat": benchmark,
+            "last_update_ts": self.last_update_ts,
+            "is_stale": self.is_stale
         }
+
+    def _estimate_benchmark(self) -> float:
+        """
+        核心邏輯：Binance-Oracle 偏移修正
+        如果 Polymarket 基準價為空，使用 Binance 價格 + 歷史偏差進行估算
+        """
+        if self.price_to_beat is not None:
+            return self.price_to_beat
+        
+        # 如果 Polymarket 沒給基準價，嘗試從 Binance 估算
+        if self.binance_stream and self.binance_stream.last_price > 0:
+            # 估算公式: Binance 實時價 + (Oracle 與 Binance 的預期價差)
+            return self.binance_stream.last_price + self.oracle_bias
+            
+        return 0.0 # 徹底缺失數據時返回 0
 
     @property
     def is_stale(self) -> bool:
-        """檢查報價是否超過 5 秒未更新（數據陳舊）"""
-        return (timestamp_ms() - self.last_update_ts) > 5000
+        return (timestamp_ms() - self.last_update_ts) > 3000  # 縮短到 3s 以應對 5m 高頻

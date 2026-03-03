@@ -43,6 +43,12 @@ class SignalGenerator:
             return None
 
         pm = self.polymarket.get_current_price()
+        
+        # 核心：檢查基準價 (Price to Beat) 是否有效
+        # 如果 Polymarket 和 Binance 都沒給出基準價，跳過
+        if pm.get('price_to_beat', 0) <= 0:
+            logger.debug("基準價 (Price to Beat) 無效，跳過")
+            return None
 
         # FIX: 任何策略入場前先檢查 PM 點差
         # Polymarket BTC 5m 常見點差 3-7%，點差過寬時

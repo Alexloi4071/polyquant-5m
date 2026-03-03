@@ -70,7 +70,11 @@ async def main():
 
     # 數據層
     binance = BinanceStream(symbol="btcusdt")
-    polymarket = PolymarketStream(token_id=token_id)
+    # 注入 binance 實例以實現偏移修正邏輯
+    polymarket = PolymarketStream(
+        token_id=token_id,
+        binance_stream=binance
+    )
     feature_calc = FeatureCalculator(binance_stream=binance)
     data_collector = DataCollector(
         data_dir=config.get('data', {}).get('raw_dir', 'data/raw'),
