@@ -12,13 +12,21 @@ class AlphaCalculator:
     """EV 與 Kelly Criterion 計算器"""
 
     def __init__(self, alpha_threshold: float = 0.05, kelly_fraction: float = 0.25,
-                 fee: float = 0.02):
+                 fee: float = 0.01, config: dict = None):
         """
         Args:
             alpha_threshold: 最低 Alpha 要求 (模型概率 - 市場價格)
             kelly_fraction:  Kelly 縮放係數 (0.25 = 1/4 Kelly，保守策略)
-            fee:             預估交易成本 (含滑點，默認 2%)
+            fee:             FIX: Polymarket 實際 taker fee ~1% (原錯誤值 2%)
+            config:          FIX Bug1: 從 config dict 讀取，與 main.py 接口對齊
         """
+        # FIX Bug1: 支持從 config dict 讀取參數
+        if config:
+            strategy_cfg = config.get('strategy', {})
+            alpha_threshold = strategy_cfg.get('alpha_threshold', alpha_threshold)
+            kelly_fraction = strategy_cfg.get('kelly_fraction', kelly_fraction)
+            fee = strategy_cfg.get('fee', fee)
+
         self.alpha_threshold = alpha_threshold
         self.kelly_fraction = kelly_fraction
         self.fee = fee
@@ -74,7 +82,7 @@ class AlphaCalculator:
     def check_signal(self, model_prob: float, ask_price: float,
                      bankroll: float = 1000.0) -> Dict:
         """
-        統一信號檢查接口，供 main.py 直接調用
+        統一信號檢查接口，供 signal_generator.py 調用
 
         Returns:
             {
@@ -84,6 +92,7 @@ class AlphaCalculator:
                 "alpha": float,
                 "reason": str
             }
+            注意: price 字段由 signal_generator.py 在返回前補充
         """
         ev = self.calculate_ev(model_prob, ask_price)
 
