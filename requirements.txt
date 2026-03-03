@@ -18,3 +18,9 @@ pyyaml>=6.0.1
 
 # 日誌
 coloredlogs>=15.0.1
+
+# FIX: Polymarket 官方 API 幫幫幫 (EIP-712 簽名 + L1/L2 認證)
+# 原始代碼缺少這些依賴，導致 API 簽名完全無法運作
+py-clob-client>=0.18.0
+eth-account>=0.11.0
+web3>=6.15.0
