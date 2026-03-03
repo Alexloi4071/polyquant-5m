@@ -1,0 +1,39 @@
+# PolyQuant-5m Configuration
+
+polymarket:
+  host: "https://clob.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  chain_id: 137  # Polygon Mainnet
+
+binance:
+  ws_url: "wss://stream.binance.com:9443/stream"
+  symbol: "btcusdt"
+
+strategy:
+  # EV 閾值 (模型概率 - 市場價格) 必須超過此值才下單
+  alpha_threshold: 0.05
+
+  # 最大單次下單金額 (USD)
+  max_position_size: 100
+
+  # Kelly Criterion 縮放係數 (保守策略用 0.25)
+  kelly_fraction: 0.25
+
+  # 大單檢測閾值 (BTC)
+  whale_order_threshold_btc: 10
+
+  # Binance 1秒價格變化閾值 (0.001 = 0.1%)
+  price_change_threshold: 0.001
+
+  # OBI 觸發閾值
+  obi_threshold: 0.3
+
+risk:
+  max_daily_loss: 200
+  max_single_loss: 50
+  max_consecutive_losses: 5
+
+data:
+  save_raw_ticks: true
+  tick_buffer_size: 1000
+  flush_interval_seconds: 300

@@ -1,0 +1,10 @@
+{
+  "comment": "在 Polymarket 找到 BTC 5m 市場後，填入對應的 Token ID",
+  "markets": {
+    "btc_5m_up": {
+      "description": "BTC Up or Down - 5 Minutes (YES token)",
+      "token_id": "FILL_IN_FROM_POLYMARKET",
+      "resolution_source": "Chainlink BTC/USD"
+    }
+  }
+}
