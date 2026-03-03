@@ -1,97 +1,83 @@
 # PolyQuant-5m
 
-**Polymarket BTC 5分鐘預測量化交易系統**
+> Polymarket BTC 5-Minute 預測市場量化交易系統
 
-微觀套利引擎，基於 Binance 延遲套利 + 訂單流失衡分析
+## 🏗️ 架構總覽
 
----
+```
+PolyQuant-5m/
+├── src/
+│   ├── data_engine/
+│   │   ├── binance_stream.py       # Binance WS 數據流
+│   │   ├── polymarket_stream.py    # Polymarket CLOB WS
+│   │   ├── feature_calculator.py  # 實時特徵計算 (Phase 2)
+│   │   ├── data_collector.py      # Tick 數據落地 (Phase 2)
+│   │   ├── chainlink_oracle.py    # Chainlink Oracle 查詢 (Phase 3)
+│   │   └── label_generator.py     # Oracle Label 生成 (Phase 3)
+│   ├── strategy_engine/
+│   │   ├── signal_generator.py    # 信號生成 (Phase 1+2)
+│   │   ├── model_trainer.py       # LightGBM 訓練 (Phase 2)
+│   │   ├── model_inference.py     # 實時推理 (Phase 2)
+│   │   ├── maker_strategy.py      # 做市策略 (Phase 4)
+│   │   └── alpha_calculator.py    # EV + Kelly 計算
+│   ├── execution_engine/
+│   │   ├── order_executor.py      # FOK + Limit 下單 (Phase 1+4)
+│   │   ├── inventory_manager.py   # 庫存管理 (Phase 4)
+│   │   └── risk_manager.py        # 風控熔斷
+│   └── utils/
+├── scripts/
+│   ├── setup_gcp.sh               # GCP 初始化
+│   ├── start_bot.sh               # 啟動機器人
+│   ├── train_model.sh             # 訓練模型 (Phase 2)
+│   └── generate_oracle_labels.sh  # 生成 Oracle Label (Phase 3)
+├── config/config.yaml
+├── data/
+│   ├── raw/                       # 原始 Tick CSV
+│   └── processed/                 # Oracle Label CSV
+├── models/                        # 訓練好的模型
+└── main.py
+```
 
-## 快速開始
+## 🚀 四個 Phase
 
-### 1. GCP VM 配置
+| Phase | 策略 | 狀態 | 說明 |
+|-------|------|------|------|
+| Phase 1 | Latency Arbitrage | ✅ 完整 | Binance 1s 價格衝擊 -> 套利 |
+| Phase 2 | ML 模型信號 | ✅ 完整 | LightGBM OBI/CVD 特徵推理 |
+| Phase 3 | Oracle Label 對齊 | ✅ 完整 | Chainlink 結算價替換 Binance Label |
+| Phase 4 | Maker 做市 | ✅ 完整 | CLOB 雙邊限價掛單 + 庫存管理 |
 
-- 區域: `europe-west2-a` (倫敦) ← **必須！靠近 Polymarket 伺服器**
-- 機型: `e2-medium` (2 vCPU, 4GB RAM)
-- 系統: Ubuntu 22.04 LTS
-
-### 2. 部署
+## ⚡ 快速啟動
 
 ```bash
-# SSH 到 VM 後
+# 1. 克隆並初始化
 git clone https://github.com/Alexloi4071/polyquant-5m.git
 cd polyquant-5m
-chmod +x scripts/*.sh
 ./scripts/setup_gcp.sh
-```
 
-### 3. 配置
-
-```bash
+# 2. 配置密鑰
 cp .env.example .env
-nano .env   # 填入 POLYMARKET_PRIVATE_KEY 和 POLYMARKET_TOKEN_ID
-```
+nano .env
 
-### 4. 測試連線
+# 3. 啟動機器人 (Paper Trading)
+tmux new -s polyquant
+./scripts/start_bot.sh
 
-```bash
-source venv/bin/activate
-python tests/test_connections.py
-```
+# 4. 收集 6 小時數據後訓練模型 (Phase 2 激活)
+./scripts/train_model.sh
 
-### 5. 啟動 (Paper Trading)
+# 5. 使用 Oracle Label 重新訓練 (Phase 3 精化)
+./scripts/generate_oracle_labels.sh
+# 然後重新運行 train_model.sh
 
-```bash
+# 6. 啟用 Maker 做市 (Phase 4)
+echo 'ENABLE_MAKER=true' >> .env
 ./scripts/start_bot.sh
 ```
 
----
+## 🖥️ 推薦 GCP 配置
 
-## 項目結構
-
-```
-src/
-├── data_engine/
-│   ├── binance_stream.py       # Binance Tick 流 + OBI/CVD 計算
-│   └── polymarket_stream.py    # Polymarket CLOB 訂單簿
-├── strategy_engine/
-│   ├── alpha_calculator.py     # EV + Kelly Criterion
-│   └── signal_generator.py     # 多策略信號生成
-├── execution_engine/
-│   ├── order_executor.py       # FOK 訂單執行
-│   └── risk_manager.py         # 風控熔斷
-└── utils/
-    └── logger.py               # 結構化日誌
-```
-
-## 數據流向
-
-```
-Binance WS ──► binance_stream (OBI/CVD)
-                       │
-Polymarket WS ──► polymarket_stream (Ask price)
-                       │
-               signal_generator
-                       │
-               alpha_calculator (EV / Kelly)
-                       │
-               risk_manager (熔斷檢查)
-                       │
-               order_executor (FOK 下單)
-```
-
-## 開發路線圖
-
-- [x] **Phase 1**: 延遲套利基礎架構
-- [ ] **Phase 2**: 接入 LightGBM 概率模型 (Isotonic Calibration)
-- [ ] **Phase 3**: Chainlink Oracle Label 對齊
-- [ ] **Phase 4**: Maker 做市策略
-
-## 風險提示
-
-- 請先在 Paper Trading 模式充分測試
-- 確保 Polygon 錢包有足夠 USDC 和 MATIC (gas)
-- 每日虧損達上限時系統會自動熔斷
-
----
-
-> ⚠️ 本項目僅供學習研究，不構成投資建議
+- **區域**: `europe-west2` (倫敦，延遲最低)
+- **機型**: `e2-small` (2 vCPU, 2GB RAM)
+- **系統**: Ubuntu 22.04 LTS
+- **靜態 IP**: 必須 (Polymarket 需要穩定出口 IP)

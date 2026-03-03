@@ -1,39 +1,55 @@
-# PolyQuant-5m Configuration
-
-polymarket:
-  host: "https://clob.polymarket.com"
-  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-  chain_id: 137  # Polygon Mainnet
+# PolyQuant-5m 主配置文件
 
 binance:
-  ws_url: "wss://stream.binance.com:9443/stream"
   symbol: "btcusdt"
+  ws_url: "wss://stream.binance.com:9443/stream"
+
+polymarket:
+  clob_ws: "wss://clob.polymarket.com/ws"
+  stale_threshold_ms: 5000
 
 strategy:
-  # EV 閾值 (模型概率 - 市場價格) 必須超過此值才下單
-  alpha_threshold: 0.05
+  # Phase 1: Latency Arbitrage
+  price_change_threshold: 0.0015    # 0.15% 觸發閾值
+  eval_interval_ms: 100             # 評估間隔 (ms)
+  bankroll: 1000.0                  # 總資金 (USD)
 
-  # 最大單次下單金額 (USD)
-  max_position_size: 100
+  # Phase 2: ML 信號
+  obi_threshold: 0.15               # OBI 觸發最小值
+  min_edge: 0.02                    # 最小 EV 邊際
+  kelly_fraction: 0.25              # Kelly 下注比例
 
-  # Kelly Criterion 縮放係數 (保守策略用 0.25)
-  kelly_fraction: 0.25
+  # EV 計算
+  max_bet_usd: 50.0
+  min_bet_usd: 5.0
 
-  # 大單檢測閾值 (BTC)
-  whale_order_threshold_btc: 10
-
-  # Binance 1秒價格變化閾值 (0.001 = 0.1%)
-  price_change_threshold: 0.001
-
-  # OBI 觸發閾值
-  obi_threshold: 0.3
+maker:
+  spread: 0.02                      # 做市點差 (2%)
+  max_position_usd: 200.0           # 最大持倉
+  quote_size_usd: 20.0              # 每次掛單金額
+  refresh_interval_s: 10            # 重新報價間隔
+  min_edge: 0.005
+  skew_factor: 0.5
 
 risk:
-  max_daily_loss: 200
-  max_single_loss: 50
-  max_consecutive_losses: 5
+  max_daily_loss_usd: 100.0         # 每日最大虧損
+  max_consecutive_losses: 5         # 最大連續虧損次數
+  max_position_usd: 500.0           # 總持倉上限
+  halt_on_trigger: true
 
 data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  flush_interval_s: 300             # 數據落地間隔 (秒)
   save_raw_ticks: true
-  tick_buffer_size: 1000
-  flush_interval_seconds: 300
+
+model:
+  model_dir: "models"
+  forward_window_ms: 300000         # Label 預測窗口 (5分鐘)
+  min_train_samples: 10000          # 最少訓練樣本數
+
+logging:
+  level: "INFO"
+  file: "logs/polyquant.log"
+  max_bytes: 10485760
+  backup_count: 5

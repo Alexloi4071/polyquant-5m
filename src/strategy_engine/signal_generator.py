@@ -1,75 +1,151 @@
 """
-信號生成器
-整合多種策略邏輯，輸出最終交易信號
+信號生成器 - Phase 1 + 2 集成版
 
-Phase 1: 延遲套利 (Latency Arbitrage)
-Phase 2: OBI/CVD 失衡信號 (待接入 ML 模型後啟用)
+Phase 1: 延遲套利 (Latency Arbitrage) - 純規則
+Phase 2: OBI/CVD + ML 模型預測概率 - 替換寫死的 0.60
 """
 from typing import Dict, Optional
 
 from src.data_engine.binance_stream import BinanceStream
 from src.data_engine.polymarket_stream import PolymarketStream
+from src.data_engine.feature_calculator import FeatureCalculator
 from src.strategy_engine.alpha_calculator import AlphaCalculator
+from src.strategy_engine.model_inference import ModelInference
 from src.utils.logger import trade_logger as logger
 
 
 class SignalGenerator:
-    """多策略信號生成器"""
+    """多策略信號生成器 (Phase 1 + Phase 2)"""
 
     def __init__(
         self,
         binance: BinanceStream,
         polymarket: PolymarketStream,
         alpha_calc: AlphaCalculator,
+        feature_calc: FeatureCalculator,
+        model_inference: ModelInference,
         config: Dict
     ):
         self.binance = binance
         self.polymarket = polymarket
         self.alpha_calc = alpha_calc
+        self.feature_calc = feature_calc
+        self.model = model_inference
         self.cfg = config["strategy"]
 
     def evaluate(self, bankroll: float = 1000.0) -> Optional[Dict]:
         """
         評估當前市場狀態，輸出交易信號
-
-        Returns:
-            signal dict 或 None (無信號)
+        策略優先級: Phase 2 ML > Phase 1 Latency Arb
         """
-        # 安全檢查: 報價不能陳舊
         if self.polymarket.is_stale:
             logger.debug("Polymarket 報價陳舊，跳過")
             return None
 
-        # === Strategy A: Latency Arbitrage (Phase 1) ===
+        # 計算當前特徵向量
+        features = self.feature_calc.compute_features()
+        pm = self.polymarket.get_current_price()
+
+        # === Strategy B: ML 模型信號 (Phase 2) ===
+        if self.model.is_loaded:
+            signal = self._evaluate_ml_signal(features, pm, bankroll)
+            if signal:
+                return signal
+
+        # === Strategy A: Latency Arbitrage (Phase 1 Fallback) ===
+        return self._evaluate_latency_arb(features, pm, bankroll)
+
+    # ------------------------------------------------------------------
+    # Phase 2: ML 模型信號
+    # ------------------------------------------------------------------
+
+    def _evaluate_ml_signal(self, features: dict, pm: dict, bankroll: float) -> Optional[Dict]:
+        """ML 模型信號評估"""
+        obi_threshold = self.cfg.get("obi_threshold", 0.15)
+        obi_now = features.get('obi_30s', 0.0)
+
+        # 只有 OBI 偏強時才觸發 ML 推理 (降低推理頻率)
+        if abs(obi_now) < obi_threshold:
+            return None
+
+        direction = "UP" if obi_now > 0 else "DOWN"
+
+        if direction == "UP" and pm.get("best_ask", 0) > 0:
+            prob, valid = self.model.predict_proba(features)
+            if not valid:
+                return None
+
+            signal = self.alpha_calc.check_signal(prob, pm["best_ask"], bankroll)
+            if signal["action"] == "BUY":
+                signal["strategy"] = "ML_OBI"
+                signal["trigger"] = (
+                    f"OBI30s={obi_now:.3f} "
+                    f"CVD={features.get('cvd_30s', 0):.2f} "
+                    f"ModelProb={prob:.3f}"
+                )
+                signal["token_side"] = "YES"
+                signal["features"] = features
+                logger.info(f"📊 ML 信號: {signal['trigger']}")
+                return signal
+
+        elif direction == "DOWN" and pm.get("best_bid", 0) > 0:
+            # 下跌方向: 預測 NO token
+            features_inv = {**features, 'obi_30s': -obi_now}  # 反轉特徵
+            prob_down, valid = self.model.predict_proba(features_inv)
+            if not valid:
+                return None
+
+            prob_no = 1.0 - prob_down  # NO token 概率
+            signal = self.alpha_calc.check_signal(prob_no, pm["best_bid"], bankroll)
+            if signal["action"] == "BUY":
+                signal["strategy"] = "ML_OBI_SHORT"
+                signal["trigger"] = (
+                    f"OBI30s={obi_now:.3f} "
+                    f"CVD={features.get('cvd_30s', 0):.2f} "
+                    f"ModelProb(NO)={prob_no:.3f}"
+                )
+                signal["token_side"] = "NO"
+                signal["features"] = features
+                logger.info(f"📊 ML 空頭信號: {signal['trigger']}")
+                return signal
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Phase 1: Latency Arbitrage Fallback
+    # ------------------------------------------------------------------
+
+    def _evaluate_latency_arb(self, features: dict, pm: dict, bankroll: float) -> Optional[Dict]:
+        """延遲套利信號評估"""
         price_change_1s = self.binance.get_1s_price_change()
         threshold = self.cfg["price_change_threshold"]
 
-        if abs(price_change_1s) >= threshold:
-            direction = "UP" if price_change_1s > 0 else "DOWN"
-            pm = self.polymarket.get_current_price()
+        if abs(price_change_1s) < threshold:
+            return None
 
-            if direction == "UP" and pm["best_ask"] > 0:
-                # 上漲套利: 買 YES
-                # Phase 2 時替換為真實模型預測值
-                estimated_prob = 0.60  # TODO: 替換為 model.predict(features)
-                signal = self.alpha_calc.check_signal(estimated_prob, pm["best_ask"], bankroll)
+        direction = "UP" if price_change_1s > 0 else "DOWN"
 
-                if signal["action"] == "BUY":
-                    signal["strategy"] = "LATENCY_ARB"
-                    signal["trigger"] = f"BinanceMove={price_change_1s*100:.3f}%"
-                    signal["token_side"] = "YES"
-                    return signal
+        if direction == "UP" and pm.get("best_ask", 0) > 0:
+            # 用 ML 概率 (如果可用)，否則用固定值
+            prob, valid = self.model.predict_proba(features)
+            estimated_prob = prob if valid else 0.60
 
-            elif direction == "DOWN" and pm["best_bid"] > 0:
-                # 下跌套利: 買 NO (即賣出 YES)
-                # TODO: 擴展 NO token 邏輯
-                pass
+            signal = self.alpha_calc.check_signal(estimated_prob, pm["best_ask"], bankroll)
+            if signal["action"] == "BUY":
+                signal["strategy"] = "LATENCY_ARB"
+                signal["trigger"] = f"BinanceMove={price_change_1s*100:.3f}%"
+                signal["token_side"] = "YES"
+                return signal
 
-        # === Strategy B: OBI 失衡信號 (Phase 2 啟用) ===
-        obi = self.binance.get_obi()
-        if abs(obi) >= self.cfg["obi_threshold"]:
-            flow = self.binance.get_taker_flow(100)
-            logger.debug(f"OBI={obi:.3f} BuyRatio={flow['buy_ratio']:.3f}")
-            # TODO: 接入 ML 模型特徵向量
+        elif direction == "DOWN" and pm.get("best_bid", 0) > 0:
+            prob, valid = self.model.predict_proba(features)
+            prob_no = (1.0 - prob) if valid else 0.60
+
+            signal = self.alpha_calc.check_signal(prob_no, pm["best_bid"], bankroll)
+            if signal["action"] == "BUY":
+                signal["strategy"] = "LATENCY_ARB_SHORT"
+                signal["trigger"] = f"BinanceMove={price_change_1s*100:.3f}%"
+                signal["token_side"] = "NO"
+                return signal
 
         return None
