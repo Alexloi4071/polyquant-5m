@@ -2,7 +2,7 @@
 信號生成器 - Phase 1 + 2 集成版
 
 Phase 1: 延遲套利 (Latency Arbitrage) - 純規則
-Phase 2: OBI/CVD + ML 模型預測概率 - 替換寫死的 0.60
+Phase 2: OBI/CVD + ML 模型預測概率
 """
 from typing import Dict, Optional
 
@@ -42,9 +42,18 @@ class SignalGenerator:
             logger.debug("Polymarket 報價陳舊，跳過")
             return None
 
-        # 計算當前特徵向量
-        features = self.feature_calc.compute_features()
         pm = self.polymarket.get_current_price()
+
+        # FIX: 任何策略入場前先檢查 PM 點差
+        # Polymarket BTC 5m 常見點差 3-7%，點差過寬時
+        # taker EV 必然為負，還沒比前已先輸給市場
+        pm_spread = pm.get('best_ask', 1.0) - pm.get('best_bid', 0.0)
+        max_spread = self.cfg.get('max_pm_spread', 0.07)
+        if pm_spread > max_spread or pm.get('best_bid', 0) <= 0 or pm.get('best_ask', 0) <= 0:
+            logger.debug(f"PM 點差過寬 ({pm_spread:.3f} > {max_spread:.3f})，跳過")
+            return None
+
+        features = self.feature_calc.compute_features()
 
         # === Strategy B: ML 模型信號 (Phase 2) ===
         if self.model.is_loaded:
@@ -64,7 +73,6 @@ class SignalGenerator:
         obi_threshold = self.cfg.get("obi_threshold", 0.15)
         obi_now = features.get('obi_30s', 0.0)
 
-        # 只有 OBI 偏強時才觸發 ML 推理 (降低推理頻率)
         if abs(obi_now) < obi_threshold:
             return None
 
@@ -79,7 +87,7 @@ class SignalGenerator:
             signal = self.alpha_calc.check_signal(prob_up, ask_price, bankroll)
             if signal["action"] == "BUY":
                 signal["strategy"] = "ML_OBI"
-                signal["price"] = ask_price   # FIX Bug3: 補充下單價格
+                signal["price"] = ask_price
                 signal["trigger"] = (
                     f"OBI30s={obi_now:.3f} "
                     f"CVD={features.get('cvd_30s', 0):.2f} "
@@ -91,18 +99,17 @@ class SignalGenerator:
                 return signal
 
         elif direction == "DOWN" and pm.get("best_bid", 0) > 0:
-            # FIX Bug3: 直接用 P(DOWN) = 1 - P(UP)，不再反轉特徵
-            # 原代碼錯誤: 反轉 obi_30s 符號並重新推理，模型未在此分佈訓練過
+            # FIX: 直接用 P(DOWN) = 1 - P(UP)，不再反轉特徵
             prob_up, valid = self.model.predict_proba(features)
             if not valid:
                 return None
 
-            prob_no = 1.0 - prob_up  # P(price goes DOWN) = 1 - P(price goes UP)
+            prob_no = 1.0 - prob_up
             bid_price = pm["best_bid"]
             signal = self.alpha_calc.check_signal(prob_no, bid_price, bankroll)
             if signal["action"] == "BUY":
                 signal["strategy"] = "ML_OBI_SHORT"
-                signal["price"] = bid_price   # FIX Bug3: 補充下單價格
+                signal["price"] = bid_price
                 signal["trigger"] = (
                     f"OBI30s={obi_now:.3f} "
                     f"CVD={features.get('cvd_30s', 0):.2f} "
@@ -137,21 +144,20 @@ class SignalGenerator:
             signal = self.alpha_calc.check_signal(estimated_prob, ask_price, bankroll)
             if signal["action"] == "BUY":
                 signal["strategy"] = "LATENCY_ARB"
-                signal["price"] = ask_price   # FIX Bug3: 補充下單價格
+                signal["price"] = ask_price
                 signal["trigger"] = f"BinanceMove={price_change_1s*100:.3f}%"
                 signal["token_side"] = "YES"
                 return signal
 
         elif direction == "DOWN" and pm.get("best_bid", 0) > 0:
             prob, valid = self.model.predict_proba(features)
-            # FIX Bug3: 直接用 1 - P(UP)，不再反轉特徵
             prob_no = (1.0 - prob) if valid else 0.60
 
             bid_price = pm["best_bid"]
             signal = self.alpha_calc.check_signal(prob_no, bid_price, bankroll)
             if signal["action"] == "BUY":
                 signal["strategy"] = "LATENCY_ARB_SHORT"
-                signal["price"] = bid_price   # FIX Bug3: 補充下單價格
+                signal["price"] = bid_price
                 signal["trigger"] = f"BinanceMove={price_change_1s*100:.3f}%"
                 signal["token_side"] = "NO"
                 return signal

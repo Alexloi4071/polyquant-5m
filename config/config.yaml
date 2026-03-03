@@ -10,43 +10,55 @@ polymarket:
 
 strategy:
   # Phase 1: Latency Arbitrage
-  price_change_threshold: 0.0015    # 0.15% 觸發閾值
-  eval_interval_ms: 100             # 評估間隔 (ms)
-  bankroll: 1000.0                  # 總資金 (USD)
+  # FIX: 提高閨值到 0.003 (0.3%)
+  # 原始 0.0015 (0.15%) 太低: PM 常見 spread 3-7%，必須 Binance 有足夠對抙信號才值得吃 taker
+  price_change_threshold: 0.003
+  eval_interval_ms: 100
+  bankroll: 1000.0
 
   # Phase 2: ML 信號
-  obi_threshold: 0.15               # OBI 觸發最小值
-  min_edge: 0.02                    # 最小 EV 邊際
-  kelly_fraction: 0.25              # Kelly 下注比例
+  obi_threshold: 0.15
+  min_edge: 0.02
+  kelly_fraction: 0.25
+
+  # FIX: 加入 Polymarket 點差上限
+  # 超過此閾値則任何策略都不入場 (雲散性太強， taker 必輸)
+  max_pm_spread: 0.07
+
+  # FIX: fee 對齊 Polymarket 實際 taker fee (1%)
+  # 原始預設 2% 过高，導致 EV 計算過於保守而漏採好交易
+  fee: 0.01
 
   # EV 計算
   max_bet_usd: 50.0
   min_bet_usd: 5.0
 
 maker:
-  spread: 0.02                      # 做市點差 (2%)
-  max_position_usd: 200.0           # 最大持倉
-  quote_size_usd: 20.0              # 每次掛單金額
-  refresh_interval_s: 10            # 重新報價間隔
+  spread: 0.02
+  max_position_usd: 200.0
+  quote_size_usd: 20.0
+  refresh_interval_s: 10
   min_edge: 0.005
   skew_factor: 0.5
 
 risk:
-  max_daily_loss_usd: 100.0         # 每日最大虧損
-  max_consecutive_losses: 5         # 最大連續虧損次數
-  max_position_usd: 500.0           # 總持倉上限
+  # FIX: 鍵名從 max_daily_loss_usd 改為 max_daily_loss
+  # 原始名稱與 risk_manager.py 中讀取的 key 不匹配，導致風控配置完全被忽略
+  max_daily_loss: 100.0
+  max_consecutive_losses: 5
+  max_position_usd: 500.0
   halt_on_trigger: true
 
 data:
   raw_dir: "data/raw"
   processed_dir: "data/processed"
-  flush_interval_s: 300             # 數據落地間隔 (秒)
+  flush_interval_s: 300
   save_raw_ticks: true
 
 model:
   model_dir: "models"
-  forward_window_ms: 300000         # Label 預測窗口 (5分鐘)
-  min_train_samples: 10000          # 最少訓練樣本數
+  forward_window_ms: 300000
+  min_train_samples: 10000
 
 logging:
   level: "INFO"

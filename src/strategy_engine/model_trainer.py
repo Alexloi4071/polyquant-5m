@@ -1,13 +1,18 @@
 """
-ML 模型訓練 Pipeline - Phase 2.3
+ML 模型訓練 Pipeline - Phase 2/3
 使用收集到的 Tick 數據訓練 LightGBM 分類器
 並用 Isotonic Regression 做概率校準
+
+Label 優先級:
+  1. Oracle Label (data/processed/labeled_ticks.csv) - Phase 3 精確標簽
+     使用 Chainlink Oracle(t+5min) vs Oracle(t) 比較
+  2. Binance Label (data/raw/ticks_*.csv) - Fallback
+     用 Binance 未來現貨價，有系統偏差，建議僅用於測試
 """
-import os
 import glob
 import pickle
 from pathlib import Path
-from typing import Tuple, List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,58 +35,91 @@ FEATURE_COLS = [
 class ModelTrainer:
     """
     LightGBM + Isotonic Calibration 訓練器
-    Label Y: 未來 5 分鐘 Binance 收盤價 > 當前價格 => 1, 否則 0
+    Label 優先使用 Oracle Label (Phase 3)，Binance Label 作為 Fallback
     """
 
     def __init__(
         self,
         data_dir: str = "data/raw",
+        processed_dir: str = "data/processed",
         model_dir: str = "models",
-        forward_window_ms: int = 300_000,  # 5分鐘
-        min_edge: float = 0.02             # 最小邊際概率優勢
+        forward_window_ms: int = 300_000,
+        min_edge: float = 0.02
     ):
         self.data_dir = Path(data_dir)
+        self.processed_dir = Path(processed_dir)
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.forward_window_ms = forward_window_ms
         self.min_edge = min_edge
         self.model = None
+        self.label_source: Optional[str] = None  # 'oracle' | 'binance_fallback'
 
     # ------------------------------------------------------------------
-    # 數據加載
+    # FIX: 數據加載 — 自動選擇最精確的 Label 來源
     # ------------------------------------------------------------------
+
+    def load_data(self) -> pd.DataFrame:
+        """
+        優先加載 Oracle Label，Fallback 到 Binance Label
+
+        Oracle Label 為什麼更好:
+        - Polymarket BTC 5m 市場結算基準是 Chainlink Oracle 價格
+        - Binance 現貨價 vs Oracle 通常有 0.05-0.3% 差距
+        - 在 5min 小幅波動市場，這個偏差直接導致 Label 噪訊和系統性詭算失賽
+        """
+        oracle_path = self.processed_dir / "labeled_ticks.csv"
+
+        if oracle_path.exists():
+            df = pd.read_csv(oracle_path)
+            df = df.sort_values('timestamp').reset_index(drop=True)
+
+            if 'oracle_label' not in df.columns:
+                raise ValueError(
+                    f"Oracle Label 文件缺少 oracle_label 欄位: {oracle_path}\n"
+                    f"請重新執行 ./scripts/generate_oracle_labels.sh"
+                )
+
+            df['label'] = df['oracle_label']
+            self.label_source = "oracle"
+            logger.info(f"✅ 使用 Oracle Label ({len(df):,} 條) | 來源: {oracle_path}")
+            logger.info(f"   Label 分佈: UP={df['label'].mean():.3f}, DOWN={(1-df['label'].mean()):.3f}")
+            return df
+
+        logger.warning("⚠️  Oracle Label 不存在，使用 Binance Label (有系統偏差)")
+        logger.warning("   建議先執行: ./scripts/generate_oracle_labels.sh")
+        df = self.load_ticks()
+        df = self.generate_binance_labels(df)
+        self.label_source = "binance_fallback"
+        return df
 
     def load_ticks(self) -> pd.DataFrame:
-        """加載所有 CSV Tick 數據"""
+        """\u52a0\u8f09\u6240\u6709 CSV Tick \u6578\u64da"""
         csv_files = glob.glob(str(self.data_dir / "ticks_*.csv"))
         if not csv_files:
-            raise FileNotFoundError(f"在 {self.data_dir} 找不到 Tick 數據")
-
+            raise FileNotFoundError(f"\u5728 {self.data_dir} \u627e\u4e0d\u5230 Tick \u6578\u64da")
         dfs = [pd.read_csv(f) for f in sorted(csv_files)]
         df = pd.concat(dfs, ignore_index=True)
         df = df.sort_values('timestamp').reset_index(drop=True)
-        logger.info(f"加載 {len(df):,} 條 Tick 數據")
+        logger.info(f"\u52a0\u8f09 {len(df):,} \u689d Tick \u6578\u64da")
         return df
 
     # ------------------------------------------------------------------
-    # Label 生成 (Binance 價格 Label)
+    # Binance Label 生成（Fallback，有偏差警告）
     # ------------------------------------------------------------------
 
-    def generate_labels(self, df: pd.DataFrame) -> pd.DataFrame:
+    def generate_binance_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        生成未來 5 分鐘價格方向 Label
-        Y=1: 未來 5 分鐘後價格上漲
-        Y=0: 未來 5 分鐘後價格下跌
+        生成未來 5 分鐘 Binance 價格方向 Label (Fallback)
+        注意: 此 Label 與 Polymarket Chainlink 結算有系統偏差
         """
         df = df.copy()
         future_prices = []
-
         prices = df['binance_price'].values
         timestamps = df['timestamp'].values
 
-        for i, ts in enumerate(timestamps):
+        for ts in timestamps:
             target_ts = ts + self.forward_window_ms
-            # 找到最接近目標時間戳的價格
             future_idx = np.searchsorted(timestamps, target_ts)
             if future_idx >= len(prices):
                 future_prices.append(np.nan)
@@ -91,7 +129,7 @@ class ModelTrainer:
         df['future_price'] = future_prices
         df['label'] = (df['future_price'] > df['binance_price']).astype(int)
         df = df.dropna(subset=['future_price'])
-        logger.info(f"Label 分佈: UP={df['label'].mean():.3f}, DOWN={(1-df['label'].mean()):.3f}")
+        logger.info(f"Binance Label 分佈: UP={df['label'].mean():.3f}, DOWN={(1-df['label'].mean()):.3f}")
         return df
 
     # ------------------------------------------------------------------
@@ -100,13 +138,16 @@ class ModelTrainer:
 
     def train(self) -> dict:
         """完整訓練 Pipeline，返回評估指標"""
-        df = self.load_ticks()
-        df = self.generate_labels(df)
+        df = self.load_data()
 
-        X = df[FEATURE_COLS].fillna(0).values
+        available_features = [col for col in FEATURE_COLS if col in df.columns]
+        missing = [col for col in FEATURE_COLS if col not in df.columns]
+        if missing:
+            logger.warning(f"缺少特徵欄位 (將用 0 填充): {missing}")
+
+        X = df[available_features].fillna(0).values
         y = df['label'].values
 
-        # 時間序列交叉驗證 (不能用隨機 shuffle)
         tscv = TimeSeriesSplit(n_splits=5)
 
         lgb_params = {
@@ -123,18 +164,14 @@ class ModelTrainer:
         }
 
         base_model = lgb.LGBMClassifier(**lgb_params)
-
-        # Isotonic Calibration 校準概率
         calibrated = CalibratedClassifierCV(
             estimator=base_model,
             method='isotonic',
             cv=tscv
         )
         calibrated.fit(X, y)
-
         self.model = calibrated
 
-        # 評估最後一折
         train_idx, val_idx = list(tscv.split(X))[-1]
         X_val, y_val = X[val_idx], y[val_idx]
         probs = calibrated.predict_proba(X_val)[:, 1]
@@ -143,27 +180,32 @@ class ModelTrainer:
             'log_loss': log_loss(y_val, probs),
             'brier_score': brier_score_loss(y_val, probs),
             'n_train': len(train_idx),
-            'n_val': len(val_idx)
+            'n_val': len(val_idx),
+            'label_source': self.label_source,
+            'features_used': available_features
         }
 
-        logger.info(f"訓練完成 | LogLoss={metrics['log_loss']:.4f} | Brier={metrics['brier_score']:.4f}")
-
-        self.save_model()
+        logger.info(
+            f"訓練完成 | LabelSource={self.label_source} | "
+            f"LogLoss={metrics['log_loss']:.4f} | Brier={metrics['brier_score']:.4f}"
+        )
+        self.save_model(available_features)
         return metrics
 
     # ------------------------------------------------------------------
     # 模型存取
     # ------------------------------------------------------------------
 
-    def save_model(self):
+    def save_model(self, feature_cols: List[str] = None):
         """保存訓練好的模型"""
         path = self.model_dir / "calibrated_lgb.pkl"
         with open(path, 'wb') as f:
             pickle.dump({
                 'model': self.model,
-                'feature_cols': FEATURE_COLS
+                'feature_cols': feature_cols or FEATURE_COLS,
+                'label_source': self.label_source
             }, f)
-        logger.info(f"模型已保存: {path}")
+        logger.info(f"模型已保存: {path} (label_source={self.label_source})")
 
     @classmethod
     def load_model(cls, model_dir: str = "models"):
@@ -175,7 +217,15 @@ class ModelTrainer:
         with open(path, 'rb') as f:
             data = pickle.load(f)
 
-        logger.info(f"模型已加載: {path}")
+        label_src = data.get('label_source', 'unknown')
+        if label_src == 'binance_fallback':
+            logger.warning(
+                f"⚠️  已加載模型使用 Binance Label 訓練，建議用 Oracle Label 重新訓練\n"
+                f"   執行: ./scripts/generate_oracle_labels.sh && ./scripts/train_model.sh"
+            )
+        else:
+            logger.info(f"✅ 模型已加載: {path} (label_source={label_src})")
+
         return data['model'], data['feature_cols']
 
 
